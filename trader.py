@@ -48,14 +48,16 @@ class Trader:
                 result[symbol] = []
                 continue
 
+            # TODO: calculate our theoretical using the best bid bet ask and best quantity fraction
             best_bid = max(order_depth.buy_orders.keys())
             best_ask = min(order_depth.sell_orders.keys())
             mid_price = (best_bid + best_ask) / 2.0
 
             # b) Keep a small rolling window of midprices
             rolling_data[symbol].append(mid_price)
-            # We can limit window length to, say, 5
-            if len(rolling_data[symbol]) > 5:
+            # Window Size
+            window_size = 5
+            if len(rolling_data[symbol]) > window_size:
                 rolling_data[symbol].pop(0)
 
             # c) Compute rolling average
@@ -71,15 +73,17 @@ class Trader:
             max_buyable = position_limit - current_position       # how many we can buy
             max_sellable = position_limit + current_position      # how many we can sell
 
-            # f) If the best ask is cheaper than our fair (rolling) price, buy up to 5
+            # f) If the best ask is cheaper than our fair (rolling) price, buy up to max position
+            max_buy = 50
             if best_ask < acceptable_price and max_buyable > 0:
-                buy_qty = min(5, max_buyable, -order_depth.sell_orders[best_ask])
+                buy_qty = min(max_buy, max_buyable, -order_depth.sell_orders[best_ask])
                 if buy_qty > 0:
                     orders.append(Order(symbol, best_ask, buy_qty))
 
-            # g) If the best bid is more expensive than our fair (rolling) price, sell up to 5
+            # g) If the best bid is more expensive than our fair (rolling) price, sell up to max sell
+            max_sell = 50
             if best_bid > acceptable_price and max_sellable > 0:
-                sell_qty = min(5, max_sellable, order_depth.buy_orders[best_bid])
+                sell_qty = min(max_sell, max_sellable, order_depth.buy_orders[best_bid])
                 if sell_qty > 0:
                     orders.append(Order(symbol, best_bid, -sell_qty))
 
