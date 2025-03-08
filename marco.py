@@ -70,6 +70,7 @@ class Logger:
         # Clear logs after flushing
         self.logs = ""
 
+logger = Logger()
 
 ################################################################################
 # STATUS CLASS
@@ -93,6 +94,21 @@ class Status:
     har_betas = {
         'RAINFOREST_RESIN': np.array([-0.73541417, -0.50879543, -0.75997904]),
         'KELP': np.array([-0.58603507, -0.30877435, -0.34055787])
+    }
+
+    arima_order = {
+        'RAINFOREST_RESIN': (0, 0, 0),
+        'KELP': (0, 0, 0),
+    }
+
+    arima_lags = {
+        'RAINFOREST_RESIN': [1, 2, 5],
+        'KELP': [1, 2, 5],
+    }
+
+    arima_betas = {
+        'RAINFOREST_RESIN': np.array([0.00000000, 0.00000000, 0.00000000]),
+        'KELP': np.array([0.00000000, 0.00000000, 0.00000000])
     }
     
     har_signal_return_correlation = {
@@ -129,58 +145,6 @@ class Strategy:
         end_idx = len(df) - window_y + 1
         return lag_features[start_idx:end_idx], features_y[start_idx:end_idx]
 
-
-    ########################################################################
-    # (B) EXACT Weighted Midprice Snippet from Notebook (VERBATIM)
-    ########################################################################
-    @staticmethod
-    def weighted_midprice(order_depth: OrderDepth, levels=1, quantity_power=1):
-        """
-        Computes the weighted mid-price using the order book depth.
-
-        Parameters:
-        - order_depth: OrderDepth object containing buy and sell orders.
-        - levels: Number of levels to include in the calculation.
-        - quantity_power: Power to raise the volume to when weighting prices.
-
-        Returns:
-        - Weighted mid-price if valid prices exist, otherwise NaN.
-        """
-
-        bid_side = []
-        ask_side = []
-
-        sorted_bids = sorted(order_depth.buy_orders.items(), key=lambda x: x[0], reverse=True)[:levels]
-        sorted_asks = sorted(order_depth.sell_orders.items(), key=lambda x: x[0], reverse=False)[:levels]
-
-        for bid_price, bid_volume in sorted_bids:
-            bid_volume = bid_volume ** quantity_power
-            if np.isfinite(bid_price) and np.isfinite(bid_volume) and bid_volume > 0:
-                bid_side.append((bid_price, bid_volume))
-
-        for ask_price, ask_volume in sorted_asks:
-            ask_volume = ask_volume ** quantity_power
-            if np.isfinite(ask_price) and np.isfinite(ask_volume) and ask_volume > 0:
-                ask_side.append((ask_price, ask_volume))
-
-        if not bid_side or not ask_side:
-            return np.nan
-
-        total_bid_weight = sum(volume for _, volume in bid_side)
-        total_ask_weight = sum(volume for _, volume in ask_side)
-
-        weighted_bid_price = (
-            sum(price * volume for price, volume in bid_side) / total_bid_weight
-            if total_bid_weight > 0 else np.nan
-        )
-        weighted_ask_price = (
-            sum(price * volume for price, volume in ask_side) / total_ask_weight
-            if total_ask_weight > 0 else np.nan
-        )
-
-        return ((weighted_bid_price + weighted_ask_price) / 2
-                if np.isfinite(weighted_bid_price) and np.isfinite(weighted_ask_price)
-                else np.nan)
 
 
     ########################################################################
@@ -264,7 +228,7 @@ class Strategy:
             if buy_qty > 0:
                 orders.append(Order(symbol, int(ask_price), buy_qty))
                 max_buyable -= buy_qty
-            break
+
             # If we hit our position limit, break out
             if max_buyable <= 0:
                 break
@@ -285,7 +249,7 @@ class Strategy:
             if sell_qty > 0:
                 orders.append(Order(symbol, int(bid_price), -sell_qty))
                 max_sellable -= sell_qty
-            break
+
             # If we hit our position limit, break out
             if max_sellable <= 0:
                 break
@@ -304,7 +268,8 @@ class Strategy:
         order_depth: OrderDepth,
         theo: float,
         past_log_returns: List[float],
-        position: int
+        position: int,
+        model = 'HAR'
     ) -> List[Order]:
         """
         1) Given past log-returns, calculate future return with a HAR model.
@@ -316,25 +281,34 @@ class Strategy:
 
         orders = []
 
-        lags = Status.har_lags[symbol]
-        betas = Status.har_betas[symbol]
-        corr_signal_return = Status.har_signal_return_correlation[symbol]
+        if model == 'HAR':
+            lags = Status.har_lags[symbol]
+            betas = Status.har_betas[symbol]
+            corr_signal_return = Status.har_signal_return_correlation[symbol]
 
-        if len(past_log_returns) < max(lags):
-            return orders, 0
+            if len(past_log_returns) < max(lags):
+                return orders, 0
 
-        features = np.zeros(len(betas))
+            features = np.zeros(len(betas))
 
-        past_log_returns_rev = past_log_returns[::-1]
-        for i, lag in enumerate(lags):
-            if i == 0:
-                features[i] = np.mean(past_log_returns_rev[:lag])
-            else:
-                features[i] = np.mean(past_log_returns_rev[lags[i-1]:lag])
+            past_log_returns_rev = past_log_returns[::-1]
+            for i, lag in enumerate(lags):
+                if i == 0:
+                    features[i] = np.mean(past_log_returns_rev[:lag])
+                else:
+                    features[i] = np.mean(past_log_returns_rev[lags[i-1]:lag])
 
-        expected_har_return = np.sum(betas * features)
+            expected_har_return = np.sum(betas * features)
 
-        future_theo = theo * (1 + corr_signal_return * expected_har_return)
+            future_theo = theo * (1 + corr_signal_return * expected_har_return)
+
+        else:
+            # ARIMA MODEL
+            lags = Status.arima_lags[symbol]
+            betas = Status.arima_betas[symbol]
+            order = Status.arima_order[symbol]
+
+            pass
 
         orders += Strategy.clear_levels(symbol, order_depth, future_theo, position)
                 
@@ -367,10 +341,10 @@ class Trade:
 
         orders_maker, orders_taker = [], []
 
-        # Strategy 2: Volatility-Based Posting (Fair Price ± 1 Std)
+        # Volatility-Based Posting (Fair Price ± 1 Std)
         orders_maker += Strategy.volatility_posting(symbol, order_depth, theo, past_log_returns, position)
 
-        # Strategy 3: Forecasting Taking Strategy
+        # Forecasting Taking Strategy
         orders_taker, expected_return = Strategy.forecasting_returns(symbol, order_depth, theo, past_log_returns, position)
 
         return orders_maker, orders_taker, expected_return
@@ -391,10 +365,10 @@ class Trade:
 
         orders_maker, orders_taker = [], []
 
-        # Strategy 2: Volatility-Based Posting (Fair Price ± 1 Std)
+        # Volatility-Based Posting (Fair Price ± 1 Std)
         orders_maker = Strategy.volatility_posting(symbol, order_depth, theo, past_log_returns, position)
 
-        # Strategy 3: Forecasting Taking Strategy
+        # Forecasting Taking Strategy
         orders_taker, expected_return = Strategy.forecasting_returns(symbol, order_depth, theo, past_log_returns, position)
 
         return orders_maker, orders_taker, expected_return
@@ -405,9 +379,66 @@ class Trade:
 # TRADER CLASS
 ################################################################################
 
-logger = Logger()
-
 class Trader:
+
+    @staticmethod
+    def weighted_midprice(order_depth: OrderDepth, levels=1, quantity_power=1):
+        """
+        Computes the weighted mid-price using the order book depth.
+
+        Parameters:
+        - order_depth: OrderDepth object containing buy and sell orders.
+        - levels: Number of levels to include in the calculation.
+        - quantity_power: Power to raise the volume to when weighting prices.
+
+        Returns:
+        - Weighted mid-price if valid prices exist, otherwise NaN.
+        """
+
+        if not order_depth.buy_orders and not order_depth.sell_orders:
+            return np.nan  # No valid order data
+
+        bid_side = []
+        ask_side = []
+
+        sorted_bids = sorted(order_depth.buy_orders.items(), key=lambda x: x[0], reverse=True)[:levels]
+        sorted_asks = sorted(order_depth.sell_orders.items(), key=lambda x: x[0], reverse=False)[:levels]
+
+        # Process Bids
+        for bid_price, bid_volume in sorted_bids:
+            if bid_volume > 0 and np.isfinite(bid_price) and np.isfinite(bid_volume):
+                bid_side.append((bid_price, bid_volume ** quantity_power))
+
+        # Process Asks - Fix the Negative Volume Issue
+        for ask_price, ask_volume in sorted_asks:
+            if abs(ask_volume) > 0 and np.isfinite(ask_price) and np.isfinite(ask_volume):
+                ask_side.append((ask_price, abs(ask_volume) ** quantity_power))  # Fix: Use abs(ask_volume)
+
+        # If either side is empty, return NaN
+        if not bid_side or not ask_side:
+            theo = np.nan
+        else:
+            
+            total_bid_weight = sum(volume for _, volume in bid_side)
+            total_ask_weight = sum(volume for _, volume in ask_side)
+
+            weighted_bid_price = (
+                sum(price * volume for price, volume in bid_side) / total_bid_weight
+                if total_bid_weight > 0 else np.nan
+            )
+
+            weighted_ask_price = (
+                sum(price * volume for price, volume in ask_side) / total_ask_weight
+                if total_ask_weight > 0 else np.nan
+            )
+
+            if np.isfinite(weighted_bid_price) and np.isfinite(weighted_ask_price):
+                theo = (weighted_bid_price * total_ask_weight + weighted_ask_price * total_bid_weight) / (total_bid_weight + total_ask_weight)
+            else:
+                theo = np.nan
+                
+        return theo
+
     def run(self, state: TradingState) -> Tuple[Dict[str, List[Order]], int, str]:
         """
         Calls Trade functions directly, which now handle multiple strategies.
@@ -477,16 +508,20 @@ class Trader:
         # Build Order Book
         for symbol, order_depth in state.order_depths.items():
 
-            theo = Strategy.weighted_midprice(order_depth, levels=1, quantity_power=1)
+            # WEIGHTED MIDPRICE
+            theo = Trader.weighted_midprice(order_depth)
 
-            past_theos[symbol].append(theo)
+            logger.print(f"Theoretical Price at timestamp {timestamp} for {symbol}: {theo}")
+            logger.print(f"Past Log Returns at timestamp {timestamp} for {symbol}: {past_log_returns[symbol]}")
 
-            if len(past_theos[symbol]) > 0 and past_theos[symbol][-1] > 0:
+            if len(past_theos[symbol]) > 0:
                 past_log_returns[symbol].append(np.log(theo / past_theos[symbol][-1]))
                 realized_return[symbol] = np.log(theo / past_theos[symbol][-1])
             else:
                 past_log_returns[symbol].append(0.0)  # Append 0 if no previous theo
                 realized_return[symbol] = 0.0
+
+            past_theos[symbol].append(theo)
 
             order_book_bids[symbol] = order_depth.buy_orders
             order_book_asks[symbol] = order_depth.sell_orders
