@@ -6,6 +6,70 @@ import jsonpickle
 from typing import Dict, List, Tuple
 from datamodel import OrderDepth, TradingState, Order
 
+class Logger:
+    """
+    A lightweight logger that stores logs in an internal buffer, truncates them
+    to avoid length overflow, then flushes them to stdout or log at the end of each run.
+
+    What’s implemented:
+    1) An internal buffer (self.logs) to gather log statements.
+    2) A max_log_length limit to prevent massive log outputs.
+    3) A flush() method that prints your final logs, optionally with your trading data.
+
+    What’s NOT implemented compared to competitor's Logger:
+    1) Detailed compression of TradingState or orders with custom data structures.
+    2) A multi-item JSON structure. (We only have a single JSON dump of relevant data.)
+    """
+
+    def __init__(self, max_log_length=3750):
+        self.logs = ""
+        self.max_log_length = max_log_length
+
+    def print(self, *objects, sep=" ", end="\n"):
+        """
+        Works like Python's print(), but accumulates logs into self.logs
+        rather than sending them directly to stdout.
+        """
+        message = sep.join(map(str, objects)) + end
+        self.logs += message
+
+    def flush(self, state, result, conversions, trader_data):
+        """
+        Truncates logs if needed, then prints a JSON structure containing:
+            - 'timestamp'
+            - 'conversions'
+            - 'traderData'
+            - 'traderLogs' (the truncated logs)
+            - 'orders' (not truncated)
+
+        Note: In your own version, you can add or remove fields as needed.
+        """
+        # Ensure logs do not exceed self.max_log_length
+        if len(self.logs) > self.max_log_length:
+            truncated_logs = self.logs[: self.max_log_length - 3] + "..."
+        else:
+            truncated_logs = self.logs
+
+        # Build a simple data structure to print or store
+        output_data = {
+            "timestamp": state.timestamp,
+            "conversions": conversions,
+            "traderData": trader_data,
+            "traderLogs": truncated_logs,
+            "orders": {
+                symbol: [
+                    (order.symbol, order.price, order.quantity) for order in order_list
+                ]
+                for symbol, order_list in result.items()
+            },
+        }
+
+        # Finally print the entire structure as JSON (or you could return it, etc.)
+        print(json.dumps(output_data, separators=(",", ":")))
+
+        # Clear logs after flushing
+        self.logs = ""
+
 
 ################################################################################
 # STATUS CLASS
@@ -27,8 +91,8 @@ class Status:
     }
 
     har_betas = {
-        'RAINFOREST_RESIN': np.array([-2.00418863, -0.88878495, -0.75997904]),
-        'KELP': np.array([-1.23536728, -0.47905328, -0.34055787])
+        'RAINFOREST_RESIN': np.array([-0.73541417, -0.50879543, -0.75997904]),
+        'KELP': np.array([-0.58603507, -0.30877435, -0.34055787])
     }
     
     har_signal_return_correlation = {
@@ -56,7 +120,7 @@ class Strategy:
             else:
                 prev_lag = lags[i-1]
                 lag_features[:, i] = (
-                    (df.rolling(lag).mean().shift(1) - df.rolling(prev_lag).mean().shift(1)) * lag / (lag - prev_lag)
+                    (df.rolling(lag).sum().shift(1) - df.rolling(prev_lag).sum().shift(1)) / (lag - prev_lag)
                 ).values.flatten()
         features_y = np.zeros(df.shape[0])
         for i in range(len(df) - window_y + 1):
@@ -140,10 +204,14 @@ class Strategy:
         """
         orders: List[Order] = []
 
+        if len(past_log_returns) < lag_volatility:
+            return orders
+
         past_log_returns_rev = past_log_returns[::-1]
 
-        lagged_vol = np.sqrt(np.mean(past_log_returns_rev[:lag_volatility] ** 2))
-        
+        past_log_returns_rev = np.array(past_log_returns[::-1])  # Convert to NumPy array
+        lagged_vol = np.sqrt(np.mean(past_log_returns_rev[:lag_volatility] ** 2))  # Now it works
+
         std_theo = lagged_vol * theo
 
         pos_limit = Status.get_position_limit(symbol)
@@ -196,7 +264,7 @@ class Strategy:
             if buy_qty > 0:
                 orders.append(Order(symbol, int(ask_price), buy_qty))
                 max_buyable -= buy_qty
-            
+            break
             # If we hit our position limit, break out
             if max_buyable <= 0:
                 break
@@ -217,7 +285,7 @@ class Strategy:
             if sell_qty > 0:
                 orders.append(Order(symbol, int(bid_price), -sell_qty))
                 max_sellable -= sell_qty
-            
+            break
             # If we hit our position limit, break out
             if max_sellable <= 0:
                 break
@@ -252,6 +320,9 @@ class Strategy:
         betas = Status.har_betas[symbol]
         corr_signal_return = Status.har_signal_return_correlation[symbol]
 
+        if len(past_log_returns) < max(lags):
+            return orders, 0
+
         features = np.zeros(len(betas))
 
         past_log_returns_rev = past_log_returns[::-1]
@@ -267,7 +338,7 @@ class Strategy:
 
         orders += Strategy.clear_levels(symbol, order_depth, future_theo, position)
                 
-        return orders
+        return orders, expected_har_return
 
 ################################################################################
 # TRADE CLASS
@@ -294,15 +365,15 @@ class Trade:
         Comment out either to disable that strategy.
         """
 
-        orders = []
+        orders_maker, orders_taker = [], []
 
         # Strategy 2: Volatility-Based Posting (Fair Price ± 1 Std)
-        orders += Strategy.volatility_posting(symbol, order_depth, theo, past_log_returns, position)
+        orders_maker += Strategy.volatility_posting(symbol, order_depth, theo, past_log_returns, position)
 
         # Strategy 3: Forecasting Taking Strategy
-        orders += Strategy.forecasting_returns(symbol, order_depth, theo, past_log_returns, position)
+        orders_taker, expected_return = Strategy.forecasting_returns(symbol, order_depth, theo, past_log_returns, position)
 
-        return orders
+        return orders_maker, orders_taker, expected_return
 
     @staticmethod
     def kelp(
@@ -318,15 +389,15 @@ class Trade:
         Comment out either to disable that strategy.
         """
 
-        orders = []
-        
+        orders_maker, orders_taker = [], []
+
         # Strategy 2: Volatility-Based Posting (Fair Price ± 1 Std)
-        orders += Strategy.volatility_posting(symbol, order_depth, theo, past_log_returns, position)
+        orders_maker = Strategy.volatility_posting(symbol, order_depth, theo, past_log_returns, position)
 
         # Strategy 3: Forecasting Taking Strategy
-        orders += Strategy.forecasting_returns(symbol, order_depth, theo, past_log_returns, position)
+        orders_taker, expected_return = Strategy.forecasting_returns(symbol, order_depth, theo, past_log_returns, position)
 
-        return orders
+        return orders_maker, orders_taker, expected_return
 
 
 
@@ -334,6 +405,7 @@ class Trade:
 # TRADER CLASS
 ################################################################################
 
+logger = Logger()
 
 class Trader:
     def run(self, state: TradingState) -> Tuple[Dict[str, List[Order]], int, str]:
@@ -349,31 +421,58 @@ class Trader:
                 rolling_data = {
                     'order_book_bids': {}, 'order_book_asks': {},
                     'past_theos': {}, 'market_trades_data': {},
-                    'past_log_returns': {},'past_trades':{},'past_position':{}
+                    'past_log_returns': {},'past_trades':{},'past_position':{},
+                    'last_maker_buy_orders': {}, 'last_maker_sell_orders': {},
+                    'last_taker_buy_orders': {}, 'last_taker_sell_orders': {},
+                    'expected_return': {},
                 }
         except:
             rolling_data = {
                 'order_book_bids': {}, 'order_book_asks': {},
                 'past_theos': {}, 'market_trades_data': {},
-                'past_log_returns': {},'past_trades':{},'past_position':{}
+                'past_log_returns': {},'past_trades':{},'past_position':{},
+                'last_maker_buy_orders': {}, 'last_maker_sell_orders': {},
+                'last_taker_buy_orders': {}, 'last_taker_sell_orders': {},
+                'expected_return': {},
             }
 
-        # Ensure dictionary structure exists for every symbol
-        for info_structure in ['past_theos', 'past_log_returns','past_trades','past_position']:
-            for symbol in state.order_depths.keys():
-                if symbol not in rolling_data[info_structure]:
-                    rolling_data[info_structure][symbol] = []
-           
+        timestamp = state.timestamp
+        logger.print(f"Timestamp: {state.timestamp}")
+                
+        # Define expected keys in rolling_data
+        expected_keys = ['past_theos', 'past_log_returns', 'past_trades', 'past_position',
+                        'last_maker_buy_orders', 'last_maker_sell_orders', 'last_taker_buy_orders', 'last_taker_sell_orders',
+                        'expected_return']
+
+        # Ensure top-level keys exist
+        for key in expected_keys:
+            rolling_data.setdefault(key, {})
+
+        # Ensure every symbol has an entry for each key
+        for symbol in state.listings:
+            for key in expected_keys:
+                rolling_data[key].setdefault(symbol, [])
+
         # We build the 'result' dictionary for orders
         result = {stock: [] for stock in state.listings}
 
         # Retrieve rolling storage
         past_theos = rolling_data['past_theos']
         past_log_returns = rolling_data['past_log_returns']
+        past_trades = rolling_data['past_trades']
+        past_position = rolling_data['past_position']
+        past_expected_return = rolling_data['expected_return']
 
         # Building Current Order Book
         order_book_bids = {}
         order_book_asks = {}
+
+        # Track order fills
+        fill_pct = {}
+
+        realized_return = {}
+
+        expected_return_next_period = {}
 
         # Build Order Book
         for symbol, order_depth in state.order_depths.items():
@@ -381,7 +480,13 @@ class Trader:
             theo = Strategy.weighted_midprice(order_depth, levels=1, quantity_power=1)
 
             past_theos[symbol].append(theo)
-            past_log_returns[symbol].append(np.log(theo / past_theos[symbol][-1]))
+
+            if len(past_theos[symbol]) > 0 and past_theos[symbol][-1] > 0:
+                past_log_returns[symbol].append(np.log(theo / past_theos[symbol][-1]))
+                realized_return[symbol] = np.log(theo / past_theos[symbol][-1])
+            else:
+                past_log_returns[symbol].append(0.0)  # Append 0 if no previous theo
+                realized_return[symbol] = 0.0
 
             order_book_bids[symbol] = order_depth.buy_orders
             order_book_asks[symbol] = order_depth.sell_orders
@@ -390,15 +495,28 @@ class Trader:
 
             if len(order_depth.buy_orders) > 0 and len(order_depth.sell_orders) > 0:
                 if symbol == "RAINFOREST_RESIN":
-                    result[symbol] = Trade.rainforest_resin(
+                    orders_maker, orders_taker, expected_return = Trade.rainforest_resin(
                         symbol, theo, order_depth, past_theos[symbol],
                         past_log_returns[symbol], current_position
                     )
+                    result[symbol] = orders_maker + orders_taker
                 elif symbol == "KELP":
-                    result[symbol] = Trade.kelp(
+                    orders_maker, orders_taker, expected_return = Trade.kelp(
                         symbol, theo, order_depth, past_theos[symbol],
                         past_log_returns[symbol], current_position
                     )
+                    result[symbol] = orders_maker + orders_taker
+                    
+                expected_return_next_period[symbol] = expected_return
+
+                rolling_data['last_maker_buy_orders'][symbol] = [o for o in orders_maker if o.quantity > 0]
+                rolling_data['last_maker_sell_orders'][symbol] = [o for o in orders_maker if o.quantity < 0]
+                rolling_data['last_taker_buy_orders'][symbol] = [o for o in orders_taker if o.quantity > 0]
+                rolling_data['last_taker_sell_orders'][symbol] = [o for o in orders_taker if o.quantity < 0]
+
+
+        logger.print(f"Expected Return at timestamp {timestamp}: {past_expected_return}")
+        logger.print(f"Realized Return at timestamp {timestamp}: {realized_return}")
 
         # Parsing Market Trades
         market_trades_data = {}
@@ -416,13 +534,33 @@ class Trader:
 
         # Parsing Own Trades
         own_trades = state.own_trades
-        for symbol, trades in own_trades.items():
-            rolling_data['past_trades'][symbol].append(trades)
+        for symbol in state.listings:
+            trades = own_trades.get(symbol, [])
+            past_trades[symbol].append(trades)
+
+            # Compute fill percentage
+            total_filled = np.sum([abs(t.quantity) for t in trades])
+            total_submitted = np.sum([abs(o.quantity) for o in rolling_data['last_maker_buy_orders'][symbol] +
+                                    rolling_data['last_maker_sell_orders'][symbol]])
+
+            fill_pct[symbol] = total_filled / total_submitted if total_submitted > 0 else 0
+
+            logger.print(f"[{timestamp}][{symbol}] Fill %: {fill_pct[symbol]:.2%}")
 
         # Parsing Position
-        position = state.position
-        for symbol, position in state.position.items():
-            rolling_data['past_position'][symbol].append(position)
+        for symbol in state.listings:
+            pos = state.position.get(symbol, 0)
+            past_position[symbol].append(pos)
+
+        # Remove oldest values if memory limit is exceeded
+        for symbol in state.order_depths.keys():
+            max_lag = max(Status.har_lags[symbol]) + 1  # Define the max memory limit
+
+            past_theos[symbol] = past_theos[symbol][-max_lag:]
+            past_log_returns[symbol] = past_log_returns[symbol][-max_lag:]
+            past_trades[symbol] = past_trades[symbol][-max_lag:]
+            past_position[symbol] = past_position[symbol][-max_lag:]
+
 
         # Update stored trader data properly
         new_trader_data = jsonpickle.encode({
@@ -431,11 +569,19 @@ class Trader:
             'past_theos': past_theos,
             'market_trades_data': market_trades_data,
             'past_log_returns': past_log_returns,
-            'past_trades': rolling_data['past_trades'],
-            'past_position': rolling_data['past_position']
+            'past_trades': past_trades,
+            'past_position': past_position,
+            'last_maker_buy_orders': rolling_data['last_maker_buy_orders'],
+            'last_maker_sell_orders': rolling_data['last_maker_sell_orders'],
+            'last_taker_buy_orders': rolling_data['last_taker_buy_orders'],
+            'last_taker_sell_orders': rolling_data['last_taker_sell_orders'],
+            'expected_return': expected_return_next_period
+
         })
 
         # Request Conversions (default is 0)
         conversions = 0
+
+        logger.flush(state, result, conversions, new_trader_data)
 
         return result, conversions, new_trader_data
