@@ -1,9 +1,11 @@
 import math
 import json
 import numpy as np
+import pandas as pd
 import jsonpickle
 from typing import Dict, List, Tuple
 from datamodel import OrderDepth, TradingState, Order
+
 
 ################################################################################
 # STATUS CLASS
@@ -12,7 +14,6 @@ from datamodel import OrderDepth, TradingState, Order
 class Status:
     """
     Stores or references per-product data like position limits, etc.
-    Here, we keep it minimal since the main snippet is in Trader.run().
     """
 
     position_limit = {
@@ -20,83 +21,253 @@ class Status:
         "KELP": 50
     }
 
+    har_lags = {
+        'RAINFOREST_RESIN': [1, 2, 5],
+        'KELP': [1, 2, 5],
+    }
+
+    har_betas = {
+        'RAINFOREST_RESIN': np.array([-2.00418863, -0.88878495, -0.75997904]),
+        'KELP': np.array([-1.23536728, -0.47905328, -0.34055787])
+    }
+    
+    har_signal_return_correlation = {
+        'RAINFOREST_RESIN': 0.6094643900796544,
+        'KELP': 0.5111646163263679
+    }
+    
     @classmethod
     def get_position_limit(cls, product: str) -> int:
         return cls.position_limit.get(product, 50)
+
 
 ################################################################################
 # STRATEGY CLASS
 ################################################################################
 
 class Strategy:
-    """
-    For demonstration, we define a single function: 'rolling_average_arb'
-    that:
-      1) Maintains rolling midprices in rolling_theos
-      2) Buys if best ask < that rolling average
-      3) Sells if best bid > that rolling average
-      4) Slices trades into max 5 units
-    """
 
+    def har_all_features_for_product(series, lags, window_y=1):
+        df = pd.DataFrame(series)
+        lag_features = np.zeros((df.shape[0], len(lags)))
+        for i, lag in enumerate(lags):
+            if i == 0:
+                lag_features[:, i] = df.rolling(lag).mean().shift(1).values.flatten()
+            else:
+                prev_lag = lags[i-1]
+                lag_features[:, i] = (
+                    (df.rolling(lag).mean().shift(1) - df.rolling(prev_lag).mean().shift(1)) * lag / (lag - prev_lag)
+                ).values.flatten()
+        features_y = np.zeros(df.shape[0])
+        for i in range(len(df) - window_y + 1):
+            features_y[i] = df.iloc[i:i+window_y].mean().values[0]
+        start_idx = max(lags)
+        end_idx = len(df) - window_y + 1
+        return lag_features[start_idx:end_idx], features_y[start_idx:end_idx]
+
+
+    ########################################################################
+    # (B) EXACT Weighted Midprice Snippet from Notebook (VERBATIM)
+    ########################################################################
     @staticmethod
-    def rolling_average_arb(
+    def weighted_midprice(order_depth: OrderDepth, levels=1, quantity_power=1):
+        """
+        Computes the weighted mid-price using the order book depth.
+
+        Parameters:
+        - order_depth: OrderDepth object containing buy and sell orders.
+        - levels: Number of levels to include in the calculation.
+        - quantity_power: Power to raise the volume to when weighting prices.
+
+        Returns:
+        - Weighted mid-price if valid prices exist, otherwise NaN.
+        """
+
+        bid_side = []
+        ask_side = []
+
+        sorted_bids = sorted(order_depth.buy_orders.items(), key=lambda x: x[0], reverse=True)[:levels]
+        sorted_asks = sorted(order_depth.sell_orders.items(), key=lambda x: x[0], reverse=False)[:levels]
+
+        for bid_price, bid_volume in sorted_bids:
+            bid_volume = bid_volume ** quantity_power
+            if np.isfinite(bid_price) and np.isfinite(bid_volume) and bid_volume > 0:
+                bid_side.append((bid_price, bid_volume))
+
+        for ask_price, ask_volume in sorted_asks:
+            ask_volume = ask_volume ** quantity_power
+            if np.isfinite(ask_price) and np.isfinite(ask_volume) and ask_volume > 0:
+                ask_side.append((ask_price, ask_volume))
+
+        if not bid_side or not ask_side:
+            return np.nan
+
+        total_bid_weight = sum(volume for _, volume in bid_side)
+        total_ask_weight = sum(volume for _, volume in ask_side)
+
+        weighted_bid_price = (
+            sum(price * volume for price, volume in bid_side) / total_bid_weight
+            if total_bid_weight > 0 else np.nan
+        )
+        weighted_ask_price = (
+            sum(price * volume for price, volume in ask_side) / total_ask_weight
+            if total_ask_weight > 0 else np.nan
+        )
+
+        return ((weighted_bid_price + weighted_ask_price) / 2
+                if np.isfinite(weighted_bid_price) and np.isfinite(weighted_ask_price)
+                else np.nan)
+
+
+    ########################################################################
+    # (C) New 'volatility_posting' strategy:
+    #     1) Compute a 2-level fair price from the top 2 bids/asks
+    #     2) Keep rolling log-returns to compute 10-lag std
+    #     3) Post orders at fair +/- 1 * std (small trade sizes).
+    ########################################################################
+    @staticmethod
+    def volatility_posting(
         symbol: str,
         order_depth: OrderDepth,
-        rolling_theos_for_symbol: List[float],
-        position: int
+        theo: float,
+        past_log_returns: List[float],
+        position: int,
+        lag_volatility: int = 10
     ) -> List[Order]:
         """
-        symbol: "RAINFOREST_RESIN" or "KELP"
-        order_depth: the buy & sell orders from TradingState
-        rolling_theos_for_symbol: the historical midprices we have so far
-        position: current position in this product
-        returns: a list of Orders
+        Given theo, if we have a valid vol, place a buy at fair - std,
+        sell at fair + std at size s.t. full-full takes us halfway to position limit.
         """
-
         orders: List[Order] = []
 
-        # if no bids or asks, do nothing
-        if len(order_depth.buy_orders) == 0 or len(order_depth.sell_orders) == 0:
-            return orders
+        past_log_returns_rev = past_log_returns[::-1]
 
-        # best_bid and best_ask
-        best_bid = max(order_depth.buy_orders.keys())
-        best_ask = min(order_depth.sell_orders.keys())
+        lagged_vol = np.sqrt(np.mean(past_log_returns_rev[:lag_volatility] ** 2))
+        
+        std_theo = lagged_vol * theo
 
-        # midprice
-        mid_price = (best_bid + best_ask) / 2.0
-
-        # append new midprice
-        rolling_theos_for_symbol.append(mid_price)
-        # keep only last 5
-        if len(rolling_theos_for_symbol) > 5:
-            rolling_theos_for_symbol.pop(0)
-
-        # average
-        rolling_avg = sum(rolling_theos_for_symbol) / len(rolling_theos_for_symbol)
-
-        # position limit is 50 for each product
         pos_limit = Status.get_position_limit(symbol)
         max_buyable = pos_limit - position
-        max_sellable = pos_limit + position  # how many we can sell
+        max_sellable = pos_limit + position
 
-        # if best_ask < average, buy small chunk
-        if best_ask < rolling_avg and max_buyable > 0:
-            # we can also limit by the ask volume (which is negative in sell_orders)
-            ask_volume = -order_depth.sell_orders[best_ask]  # flip sign
-            buy_qty = min(5, max_buyable, ask_volume)
-            if buy_qty > 0:
-                orders.append(Order(symbol, int(best_ask), buy_qty))
+        if std_theo > 0:
+            buy_price = theo - std_theo
+            sell_price = theo + std_theo
 
-        # if best_bid > average, sell small chunk
-        if best_bid > rolling_avg and max_sellable > 0:
-            bid_volume = order_depth.buy_orders[best_bid]
-            sell_qty = min(5, max_sellable, bid_volume)
-            if sell_qty > 0:
-                orders.append(Order(symbol, int(best_bid), -sell_qty))
+            if max_buyable > 0:
+                buy_qty = max_buyable // 2
+                orders.append(Order(symbol, int(buy_price), buy_qty))
+
+            if max_sellable > 0:
+                sell_qty = max_sellable // 2
+                orders.append(Order(symbol, int(sell_price), -sell_qty))
 
         return orders
 
+    @staticmethod
+    def clear_levels(
+        symbol: str,
+        order_depth: OrderDepth,
+        theo: float,
+        position: int,
+    ) -> List[Order]:
+        """
+        Clear all levels that have expectation relative to theo.
+        """
+        
+        orders = []
+
+        pos_limit = Status.get_position_limit(symbol)
+
+        max_buyable = pos_limit - position
+
+        asks_sorted = sorted(order_depth.sell_orders.items(), key=lambda x: x[0])
+        for ask_price, ask_vol in asks_sorted:
+
+            # sell_orders have negative volumes, so flip sign
+            volume_available = -ask_vol
+            
+            # If the ask price exceeds our theoretical value, stop buying
+            if ask_price > theo:
+                break
+
+            # How many we can buy here, respecting our remaining limit
+            buy_qty = min(max_buyable, volume_available)
+            if buy_qty > 0:
+                orders.append(Order(symbol, int(ask_price), buy_qty))
+                max_buyable -= buy_qty
+            
+            # If we hit our position limit, break out
+            if max_buyable <= 0:
+                break
+
+        max_sellable = pos_limit + position  # Maximum amount we can sell
+
+        bids_sorted = sorted(order_depth.buy_orders.items(), key=lambda x: x[0], reverse=True)
+        for bid_price, bid_vol in bids_sorted:
+
+            # If the bid price is below our theoretical value, stop selling
+            if bid_price < theo:
+                break
+
+            volume_available = bid_vol  # Buy orders are positive volumes
+
+            # How many we can sell here, respecting our remaining limit
+            sell_qty = min(max_sellable, volume_available)
+            if sell_qty > 0:
+                orders.append(Order(symbol, int(bid_price), -sell_qty))
+                max_sellable -= sell_qty
+            
+            # If we hit our position limit, break out
+            if max_sellable <= 0:
+                break
+
+        return orders
+
+    ########################################################################
+    # (C) New 'volatility_posting' strategy:
+    #     1) Compute a 2-level fair price from the top 2 bids/asks
+    #     2) Keep rolling log-returns to compute 10-lag std
+    #     3) Post orders at fair +/- 1 * std (small trade sizes).
+    ########################################################################
+    @staticmethod
+    def forecasting_returns(
+        symbol: str,
+        order_depth: OrderDepth,
+        theo: float,
+        past_log_returns: List[float],
+        position: int
+    ) -> List[Order]:
+        """
+        1) Given past log-returns, calculate future return with a HAR model.
+        3) If we have orders we'd like to trade against, we lift / sell all levels above / below our fair price.
+
+        Hardcoded Coefficients:
+            lags, betas, corr_signal_return
+        """
+
+        orders = []
+
+        lags = Status.har_lags[symbol]
+        betas = Status.har_betas[symbol]
+        corr_signal_return = Status.har_signal_return_correlation[symbol]
+
+        features = np.zeros(len(betas))
+
+        past_log_returns_rev = past_log_returns[::-1]
+        for i, lag in enumerate(lags):
+            if i == 0:
+                features[i] = np.mean(past_log_returns_rev[:lag])
+            else:
+                features[i] = np.mean(past_log_returns_rev[lags[i-1]:lag])
+
+        expected_har_return = np.sum(betas * features)
+
+        future_theo = theo * (1 + corr_signal_return * expected_har_return)
+
+        orders += Strategy.clear_levels(symbol, order_depth, future_theo, position)
+                
+        return orders
 
 ################################################################################
 # TRADE CLASS
@@ -104,127 +275,130 @@ class Strategy:
 
 class Trade:
     """
-    For each product, we call 'rolling_average_arb' from Strategy.
-    This is to demonstrate how you'd orchestrate multiple products.
+    Handles execution for each product.
+    - Calls multiple strategies internally, combining the results.
+    - This allows the Trader class to remain simple and only call Trade.rainforest_resin() and Trade.kelp().
     """
 
     @staticmethod
     def rainforest_resin(
         symbol: str,
+        theo: float,
         order_depth: OrderDepth,
-        rolling_theos_for_symbol: List[float],
+        past_theos: List[float],
+        past_log_returns: List[float],
         position: int
     ) -> List[Order]:
-        return Strategy.rolling_average_arb(symbol, order_depth, rolling_theos_for_symbol, position)
+        """
+        Executes BOTH strategies for RAINFOREST_RESIN and merges orders.
+        Comment out either to disable that strategy.
+        """
+
+        orders = []
+
+        # Strategy 2: Volatility-Based Posting (Fair Price ± 1 Std)
+        orders += Strategy.volatility_posting(symbol, order_depth, theo, past_log_returns, position)
+
+        # Strategy 3: Forecasting Taking Strategy
+        orders += Strategy.forecasting_returns(symbol, order_depth, theo, past_log_returns, position)
+
+        return orders
 
     @staticmethod
     def kelp(
         symbol: str,
+        theo: float,
         order_depth: OrderDepth,
-        rolling_theos_for_symbol: List[float],
+        past_theos: List[float],
+        past_log_returns: List[float],
         position: int
     ) -> List[Order]:
-        return Strategy.rolling_average_arb(symbol, order_depth, rolling_theos_for_symbol, position)
+        """
+        Executes BOTH strategies for RAINFOREST_RESIN and merges orders.
+        Comment out either to disable that strategy.
+        """
+
+        orders = []
+        
+        # Strategy 2: Volatility-Based Posting (Fair Price ± 1 Std)
+        orders += Strategy.volatility_posting(symbol, order_depth, theo, past_log_returns, position)
+
+        # Strategy 3: Forecasting Taking Strategy
+        orders += Strategy.forecasting_returns(symbol, order_depth, theo, past_log_returns, position)
+
+        return orders
+
+
 
 ################################################################################
 # TRADER CLASS
 ################################################################################
 
-class Trader:
-    """
-    This class includes the original snippet EXACTLY as requested inside run(...).
-    We also embed calls to 'Trade.rainforest_resin' / 'Trade.kelp' inside that snippet,
-    to produce final orders.
-    """
 
+class Trader:
     def run(self, state: TradingState) -> Tuple[Dict[str, List[Order]], int, str]:
         """
-        A super-basic algorithm that:
-         1) Maintains a small rolling midprice for each traded symbol
-         2) Buys if best ask < rolling average, sells if best bid > rolling average
-         3) Uses a small (hard-coded) trade size and respects position limits (50 for both products)
-
-        We keep your original snippet lines & comments below, including the big 'try/except.'
-        We'll store our rolling midprices in 'rolling_data["past_theos"][symbol]' to match your snippet.
-        We'll then call the new Strategy logic to generate orders.
+        Calls Trade functions directly, which now handle multiple strategies.
         """
 
         # Attempt to decode stored data from previous runs:
         try:
-            if state.traderData != "" and state.traderData != "SAMPLE":
+            if state.traderData and state.traderData != "SAMPLE":
                 rolling_data = jsonpickle.decode(state.traderData)
             else:
-                # For first run or empty stored data, init a dictionary with empty lists
                 rolling_data = {
-                    'order_book_bids': {},
-                    'order_book_asks': {},
-                    'past_theos': {},
-                    'market_trades_data': {}
+                    'order_book_bids': {}, 'order_book_asks': {},
+                    'past_theos': {}, 'market_trades_data': {},
+                    'past_log_returns': {},'past_trades':{},'past_position':{}
                 }
         except:
             rolling_data = {
-                'order_book_bids': {},
-                'order_book_asks': {},
-                'past_theos': {},
-                'market_trades_data': {}
+                'order_book_bids': {}, 'order_book_asks': {},
+                'past_theos': {}, 'market_trades_data': {},
+                'past_log_returns': {},'past_trades':{},'past_position':{}
             }
 
+        # Ensure dictionary structure exists for every symbol
+        for info_structure in ['past_theos', 'past_log_returns','past_trades','past_position']:
+            for symbol in state.order_depths.keys():
+                if symbol not in rolling_data[info_structure]:
+                    rolling_data[info_structure][symbol] = []
+           
         # We build the 'result' dictionary for orders
         result = {stock: [] for stock in state.listings}
 
-        # Getting Information From Previous Period
-        past_order_book_bids = rolling_data['order_book_bids']
-        past_order_book_asks = rolling_data['order_book_asks']
+        # Retrieve rolling storage
         past_theos = rolling_data['past_theos']
-        past_market_trades_data = rolling_data['market_trades_data']
-
-        rolling_theos = past_theos  # We'll store midprices in rolling_theos[symbol]
-
-        # Make sure each symbol has a list in rolling_theos
-        for symbol in state.order_depths.keys():
-            if symbol not in rolling_theos:
-                rolling_theos[symbol] = []
+        past_log_returns = rolling_data['past_log_returns']
 
         # Building Current Order Book
         order_book_bids = {}
         order_book_asks = {}
 
+        # Build Order Book
         for symbol, order_depth in state.order_depths.items():
-            # the user snippet: store keys in order_book_bids/asks
-            order_book_bids[symbol] = order_depth.buy_orders.keys()
-            order_book_asks[symbol] = order_depth.sell_orders.keys()
 
-            # We'll get the current position from state.position or 0
+            theo = Strategy.weighted_midprice(order_depth, levels=1, quantity_power=1)
+
+            past_theos[symbol].append(theo)
+            past_log_returns[symbol].append(np.log(theo / past_theos[symbol][-1]))
+
+            order_book_bids[symbol] = order_depth.buy_orders
+            order_book_asks[symbol] = order_depth.sell_orders
+
             current_position = state.position.get(symbol, 0)
 
-            # Use the new 'Trade' logic for RAINFOREST_RESIN or KELP
-            if len(order_book_bids[symbol]) > 0 and len(order_book_asks[symbol]) > 0:
-                # if the product is RAINFOREST_RESIN, call that method
+            if len(order_depth.buy_orders) > 0 and len(order_depth.sell_orders) > 0:
                 if symbol == "RAINFOREST_RESIN":
-                    # This calls Strategy.rolling_average_arb internally
-                    orders = Trade.rainforest_resin(
-                        symbol=symbol,
-                        order_depth=order_depth,
-                        rolling_theos_for_symbol=rolling_theos[symbol],
-                        position=current_position
+                    result[symbol] = Trade.rainforest_resin(
+                        symbol, theo, order_depth, past_theos[symbol],
+                        past_log_returns[symbol], current_position
                     )
-                    result[symbol] = orders
-
-                # if the product is KELP, call that method
                 elif symbol == "KELP":
-                    orders = Trade.kelp(
-                        symbol=symbol,
-                        order_depth=order_depth,
-                        rolling_theos_for_symbol=rolling_theos[symbol],
-                        position=current_position
+                    result[symbol] = Trade.kelp(
+                        symbol, theo, order_depth, past_theos[symbol],
+                        past_log_returns[symbol], current_position
                     )
-                    result[symbol] = orders
-                else:
-                    # If there's some other product, do nothing here
-                    result[symbol] = []
-            else:
-                # If no buy or sell orders, do nothing
-                result[symbol] = []
 
         # Parsing Market Trades
         market_trades_data = {}
@@ -242,19 +416,26 @@ class Trader:
 
         # Parsing Own Trades
         own_trades = state.own_trades
+        for symbol, trades in own_trades.items():
+            rolling_data['past_trades'][symbol].append(trades)
 
         # Parsing Position
         position = state.position
+        for symbol, position in state.position.items():
+            rolling_data['past_position'][symbol].append(position)
 
-        # Set Future Trader Data From Current Information
-        new_rolling_data = {}
-        new_rolling_data['order_book_bids'] = order_book_bids
-        new_rolling_data['order_book_asks'] = order_book_asks
-        new_rolling_data['past_theos'] = rolling_theos
-        new_rolling_data['market_trades_data'] = market_trades_data
-        new_trader_data = jsonpickle.encode(new_rolling_data)
+        # Update stored trader data properly
+        new_trader_data = jsonpickle.encode({
+            'order_book_bids': order_book_bids,
+            'order_book_asks': order_book_asks,
+            'past_theos': past_theos,
+            'market_trades_data': market_trades_data,
+            'past_log_returns': past_log_returns,
+            'past_trades': rolling_data['past_trades'],
+            'past_position': rolling_data['past_position']
+        })
 
-        # Request Conversions
+        # Request Conversions (default is 0)
         conversions = 0
 
         return result, conversions, new_trader_data
