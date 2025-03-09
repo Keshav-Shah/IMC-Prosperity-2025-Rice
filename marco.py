@@ -95,27 +95,27 @@ class Status:
         'RAINFOREST_RESIN': np.array([-0.73541417, -0.50879543, -0.75997904]),
         'KELP': np.array([-0.58603507, -0.30877435, -0.34055787])
     }
-
-    arima_order = {
-        'RAINFOREST_RESIN': (0, 0, 0),
-        'KELP': (0, 0, 0),
-    }
-
-    arima_lags = {
-        'RAINFOREST_RESIN': [1, 2, 5],
-        'KELP': [1, 2, 5],
-    }
-
-    arima_betas = {
-        'RAINFOREST_RESIN': np.array([0.00000000, 0.00000000, 0.00000000]),
-        'KELP': np.array([0.00000000, 0.00000000, 0.00000000])
-    }
-    
+        
     har_signal_return_correlation = {
         'RAINFOREST_RESIN': 0.6094643900796544,
         'KELP': 0.5111646163263679
     }
+
+    arima_parameters = {
+        'RAINFOREST_RESIN': (1, 0, 1),
+        'KELP': (1, 0, 1),
+    }
+
+    arima_betas = {
+        'RAINFOREST_RESIN': (np.array([0.042213]), np.array([-0.79403773])),
+        'KELP': (np.array([0.0065506]), np.array([-0.6064787]))
+    }
     
+    arima_signal_return_correlation = {
+        'RAINFOREST_RESIN': 0.66059118,
+        'KELP': 0.5244263
+    }
+
     @classmethod
     def get_position_limit(cls, product: str) -> int:
         return cls.position_limit.get(product, 50)
@@ -268,6 +268,7 @@ class Strategy:
         order_depth: OrderDepth,
         theo: float,
         past_log_returns: List[float],
+        past_residuals: List[float],
         position: int,
         model = 'HAR'
     ) -> List[Order]:
@@ -304,12 +305,29 @@ class Strategy:
 
         else:
             # ARIMA MODEL
-            lags = Status.arima_lags[symbol]
-            betas = Status.arima_betas[symbol]
-            order = Status.arima_order[symbol]
+            betas_y, betas_residual = Status.arima_betas[symbol]
+            p, d, q = Status.arima_parameters[symbol]
+            corr_signal_return = Status.arima_signal_return_correlation[symbol]
 
-            pass
+            if d > 0:
+                past_log_returns = np.diff(past_log_returns, d)
+                
+            if len(past_log_returns) < max(p, q):
+                return orders, 0
 
+            features = np.zeros(len(betas_y))
+
+            past_log_returns_rev = past_log_returns[::-1]
+
+            past_residuals_rev = past_residuals[::-1]
+
+            ar_term = np.dot(betas_y, past_log_returns_rev[:len(betas_y)]) if len(betas_y) > 0 else 0.0
+            ma_term = np.dot(betas_residual, past_residuals_rev[:len(betas_residual)]) if len(betas_residual) > 0 else 0.0
+
+            expected_arima_return = ar_term + ma_term
+
+            future_theo = theo * (1 + corr_signal_return * expected_arima_return)
+            
         orders += Strategy.clear_levels(symbol, order_depth, future_theo, position)
                 
         return orders, expected_har_return
@@ -332,6 +350,7 @@ class Trade:
         order_depth: OrderDepth,
         past_theos: List[float],
         past_log_returns: List[float],
+        past_residuals: List[float],
         position: int
     ) -> List[Order]:
         """
@@ -345,7 +364,7 @@ class Trade:
         orders_maker += Strategy.volatility_posting(symbol, order_depth, theo, past_log_returns, position)
 
         # Forecasting Taking Strategy
-        orders_taker, expected_return = Strategy.forecasting_returns(symbol, order_depth, theo, past_log_returns, position)
+        orders_taker, expected_return = Strategy.forecasting_returns(symbol, order_depth, theo, past_log_returns, past_residuals, position, model='ARIMA')
 
         return orders_maker, orders_taker, expected_return
 
@@ -356,6 +375,7 @@ class Trade:
         order_depth: OrderDepth,
         past_theos: List[float],
         past_log_returns: List[float],
+        past_residuals: List[float],
         position: int
     ) -> List[Order]:
         """
@@ -369,7 +389,7 @@ class Trade:
         orders_maker = Strategy.volatility_posting(symbol, order_depth, theo, past_log_returns, position)
 
         # Forecasting Taking Strategy
-        orders_taker, expected_return = Strategy.forecasting_returns(symbol, order_depth, theo, past_log_returns, position)
+        orders_taker, expected_return = Strategy.forecasting_returns(symbol, order_depth, theo, past_log_returns, past_residuals, position, model='ARIMA')
 
         return orders_maker, orders_taker, expected_return
 
@@ -452,7 +472,7 @@ class Trader:
                 rolling_data = {
                     'order_book_bids': {}, 'order_book_asks': {},
                     'past_theos': {}, 'market_trades_data': {},
-                    'past_log_returns': {},'past_trades':{},'past_position':{},
+                    'past_log_returns': {}, 'past_residuals': {}, 'past_trades':{},'past_position':{},
                     'last_maker_buy_orders': {}, 'last_maker_sell_orders': {},
                     'last_taker_buy_orders': {}, 'last_taker_sell_orders': {},
                     'expected_return': {},
@@ -461,7 +481,7 @@ class Trader:
             rolling_data = {
                 'order_book_bids': {}, 'order_book_asks': {},
                 'past_theos': {}, 'market_trades_data': {},
-                'past_log_returns': {},'past_trades':{},'past_position':{},
+                'past_log_returns': {}, 'past_residuals': {}, 'past_trades':{},'past_position':{},
                 'last_maker_buy_orders': {}, 'last_maker_sell_orders': {},
                 'last_taker_buy_orders': {}, 'last_taker_sell_orders': {},
                 'expected_return': {},
@@ -471,7 +491,7 @@ class Trader:
         logger.print(f"Timestamp: {state.timestamp}")
                 
         # Define expected keys in rolling_data
-        expected_keys = ['past_theos', 'past_log_returns', 'past_trades', 'past_position',
+        expected_keys = ['past_theos', 'past_log_returns', 'past_residuals', 'past_trades', 'past_position',
                         'last_maker_buy_orders', 'last_maker_sell_orders', 'last_taker_buy_orders', 'last_taker_sell_orders',
                         'expected_return']
 
@@ -490,6 +510,7 @@ class Trader:
         # Retrieve rolling storage
         past_theos = rolling_data['past_theos']
         past_log_returns = rolling_data['past_log_returns']
+        past_residuals = rolling_data['past_residuals']
         past_trades = rolling_data['past_trades']
         past_position = rolling_data['past_position']
         past_expected_return = rolling_data['expected_return']
@@ -499,7 +520,8 @@ class Trader:
         order_book_asks = {}
 
         # Track order fills
-        fill_pct = {}
+        maker_fill_pct = {}
+        taker_fill_pct = {}
 
         realized_return = {}
 
@@ -517,9 +539,11 @@ class Trader:
             if len(past_theos[symbol]) > 0:
                 past_log_returns[symbol].append(np.log(theo / past_theos[symbol][-1]))
                 realized_return[symbol] = np.log(theo / past_theos[symbol][-1])
+                past_residuals[symbol].append(realized_return[symbol] - past_log_returns[symbol][-1])
             else:
                 past_log_returns[symbol].append(0.0)  # Append 0 if no previous theo
                 realized_return[symbol] = 0.0
+                past_residuals[symbol].append(0.0)
 
             past_theos[symbol].append(theo)
 
@@ -532,13 +556,13 @@ class Trader:
                 if symbol == "RAINFOREST_RESIN":
                     orders_maker, orders_taker, expected_return = Trade.rainforest_resin(
                         symbol, theo, order_depth, past_theos[symbol],
-                        past_log_returns[symbol], current_position
+                        past_log_returns[symbol], past_residuals[symbol], current_position
                     )
                     result[symbol] = orders_maker + orders_taker
                 elif symbol == "KELP":
                     orders_maker, orders_taker, expected_return = Trade.kelp(
                         symbol, theo, order_depth, past_theos[symbol],
-                        past_log_returns[symbol], current_position
+                        past_log_returns[symbol], past_residuals[symbol], current_position
                     )
                     result[symbol] = orders_maker + orders_taker
                     
@@ -575,12 +599,16 @@ class Trader:
 
             # Compute fill percentage
             total_filled = np.sum([abs(t.quantity) for t in trades])
-            total_submitted = np.sum([abs(o.quantity) for o in rolling_data['last_maker_buy_orders'][symbol] +
+            total_maker_submitted = np.sum([abs(o.quantity) for o in rolling_data['last_maker_buy_orders'][symbol] +
                                     rolling_data['last_maker_sell_orders'][symbol]])
+            
+            total_taker_submitted = np.sum([abs(o.quantity) for o in rolling_data['last_taker_buy_orders'][symbol] +
+                                    rolling_data['last_taker_sell_orders'][symbol]])
 
-            fill_pct[symbol] = total_filled / total_submitted if total_submitted > 0 else 0
+            maker_fill_pct[symbol] = total_filled / total_maker_submitted if total_maker_submitted > 0 else 0
+            taker_fill_pct[symbol] = total_filled / total_taker_submitted if total_taker_submitted > 0 else 0
 
-            logger.print(f"[{timestamp}][{symbol}] Fill %: {fill_pct[symbol]:.2%}")
+            logger.print(f"[{timestamp}][{symbol}] Maker Fill %: {maker_fill_pct[symbol]:.2%}, Taker Fill %: {taker_fill_pct[symbol]:.2%}")
 
         # Parsing Position
         for symbol in state.listings:
@@ -593,6 +621,7 @@ class Trader:
 
             past_theos[symbol] = past_theos[symbol][-max_lag:]
             past_log_returns[symbol] = past_log_returns[symbol][-max_lag:]
+            past_residuals[symbol] = past_residuals[symbol][-max_lag:]
             past_trades[symbol] = past_trades[symbol][-max_lag:]
             past_position[symbol] = past_position[symbol][-max_lag:]
 
@@ -604,6 +633,7 @@ class Trader:
             'past_theos': past_theos,
             'market_trades_data': market_trades_data,
             'past_log_returns': past_log_returns,
+            'past_residuals': past_residuals,
             'past_trades': past_trades,
             'past_position': past_position,
             'last_maker_buy_orders': rolling_data['last_maker_buy_orders'],
