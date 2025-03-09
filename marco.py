@@ -299,9 +299,9 @@ class Strategy:
                 else:
                     features[i] = np.mean(past_log_returns_rev[lags[i-1]:lag])
 
-            expected_har_return = np.sum(betas * features)
+            expected_return = np.sum(betas * features)
 
-            future_theo = theo * (1 + corr_signal_return * expected_har_return)
+            future_theo = theo * (1 + corr_signal_return * expected_return)
 
         else:
             # ARIMA MODEL
@@ -324,13 +324,13 @@ class Strategy:
             ar_term = np.dot(betas_y, past_log_returns_rev[:len(betas_y)]) if len(betas_y) > 0 else 0.0
             ma_term = np.dot(betas_residual, past_residuals_rev[:len(betas_residual)]) if len(betas_residual) > 0 else 0.0
 
-            expected_arima_return = ar_term + ma_term
+            expected_return = ar_term + ma_term
 
-            future_theo = theo * (1 + corr_signal_return * expected_arima_return)
+            future_theo = theo * (1 + corr_signal_return * expected_return)
             
         orders += Strategy.clear_levels(symbol, order_depth, future_theo, position)
                 
-        return orders, expected_har_return
+        return orders, expected_return
 
 ################################################################################
 # TRADE CLASS
