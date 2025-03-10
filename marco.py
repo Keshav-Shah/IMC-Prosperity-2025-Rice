@@ -103,12 +103,12 @@ class Status:
 
     arima_parameters = {
         'RAINFOREST_RESIN': (1, 0, 1),
-        'KELP': (1, 0, 1),
+        'KELP': (0, 0, 1),
     }
 
     arima_betas = {
         'RAINFOREST_RESIN': (np.array([0.042213]), np.array([-0.79403773])),
-        'KELP': (np.array([0.0065506]), np.array([-0.6064787]))
+        'KELP': (np.array([]), np.array([-0.6]))
     }
     
     arima_signal_return_correlation = {
@@ -324,9 +324,9 @@ class Strategy:
             ar_term = np.dot(betas_y, past_log_returns_rev[:len(betas_y)]) if len(betas_y) > 0 else 0.0
             ma_term = np.dot(betas_residual, past_residuals_rev[:len(betas_residual)]) if len(betas_residual) > 0 else 0.0
 
-            expected_return = ar_term + ma_term
+            expected_return = corr_signal_return * (np.exp(ar_term + ma_term) - 1)
 
-            future_theo = theo * (1 + corr_signal_return * expected_return)
+            future_theo = theo * (1 + expected_return)
             
         orders += Strategy.clear_levels(symbol, order_depth, future_theo, position)
                 
@@ -533,17 +533,18 @@ class Trader:
             # WEIGHTED MIDPRICE
             theo = Trader.weighted_midprice(order_depth)
 
-            logger.print(f"Theoretical Price at timestamp {timestamp} for {symbol}: {theo}")
-            logger.print(f"Past Log Returns at timestamp {timestamp} for {symbol}: {past_log_returns[symbol]}")
 
             if len(past_theos[symbol]) > 0:
                 past_log_returns[symbol].append(np.log(theo / past_theos[symbol][-1]))
                 realized_return[symbol] = np.log(theo / past_theos[symbol][-1])
-                past_residuals[symbol].append(realized_return[symbol] - past_log_returns[symbol][-1])
+                past_residuals[symbol].append(realized_return[symbol] - past_expected_return[symbol][-1])
             else:
                 past_log_returns[symbol].append(0.0)  # Append 0 if no previous theo
                 realized_return[symbol] = 0.0
                 past_residuals[symbol].append(0.0)
+
+            logger.print(f"Expected Return at timestamp {timestamp} for {symbol}: {past_expected_return[symbol]}")
+            logger.print(f"Realized Return at timestamp {timestamp} for {symbol}: {realized_return[symbol]}")
 
             past_theos[symbol].append(theo)
 
@@ -565,7 +566,7 @@ class Trader:
                         past_log_returns[symbol], past_residuals[symbol], current_position
                     )
                     result[symbol] = orders_maker + orders_taker
-                    
+
                 expected_return_next_period[symbol] = expected_return
 
                 rolling_data['last_maker_buy_orders'][symbol] = [o for o in orders_maker if o.quantity > 0]
@@ -574,8 +575,6 @@ class Trader:
                 rolling_data['last_taker_sell_orders'][symbol] = [o for o in orders_taker if o.quantity < 0]
 
 
-        logger.print(f"Expected Return at timestamp {timestamp}: {past_expected_return}")
-        logger.print(f"Realized Return at timestamp {timestamp}: {realized_return}")
 
         # Parsing Market Trades
         market_trades_data = {}
