@@ -3,72 +3,115 @@ import json
 import numpy as np
 import pandas as pd
 import jsonpickle
-from typing import Dict, List, Tuple
-from datamodel import OrderDepth, TradingState, Order
+from typing import Dict, List, Tuple, Any
+from datamodel import Listing, ConversionObservation, Observation, Order, OrderDepth, Trade, TradingState, ProsperityEncoder, Symbol
 
 class Logger:
-    """
-    A lightweight logger that stores logs in an internal buffer, truncates them
-    to avoid length overflow, then flushes them to stdout or log at the end of each run.
-
-    What’s implemented:
-    1) An internal buffer (self.logs) to gather log statements.
-    2) A max_log_length limit to prevent massive log outputs.
-    3) A flush() method that prints your final logs, optionally with your trading data.
-
-    What’s NOT implemented compared to competitor's Logger:
-    1) Detailed compression of TradingState or orders with custom data structures.
-    2) A multi-item JSON structure. (We only have a single JSON dump of relevant data.)
-    """
-
-    def __init__(self, max_log_length=3750):
+    def __init__(self) -> None:
         self.logs = ""
-        self.max_log_length = max_log_length
+        self.max_log_length = 3750
 
-    def print(self, *objects, sep=" ", end="\n"):
-        """
-        Works like Python's print(), but accumulates logs into self.logs
-        rather than sending them directly to stdout.
-        """
-        message = sep.join(map(str, objects)) + end
-        self.logs += message
+    def print(self, *objects: Any, sep: str = " ", end: str = "\n") -> None:
+        self.logs += sep.join(map(str, objects)) + end
 
-    def flush(self, state, result, conversions, trader_data):
-        """
-        Truncates logs if needed, then prints a JSON structure containing:
-            - 'timestamp'
-            - 'conversions'
-            - 'traderData'
-            - 'traderLogs' (the truncated logs)
-            - 'orders' (not truncated)
-
-        Note: In your own version, you can add or remove fields as needed.
-        """
-        # Ensure logs do not exceed self.max_log_length
-        if len(self.logs) > self.max_log_length:
-            truncated_logs = self.logs[: self.max_log_length - 3] + "..."
-        else:
-            truncated_logs = self.logs
-
-        # Build a simple data structure to print or store
-        output_data = {
+    def flush(self, state: TradingState, orders: dict[Symbol, list[Order]], conversions: int, trader_data: str) -> None:
+        flat_state = {
             "timestamp": state.timestamp,
-            "conversions": conversions,
-            "traderData": trader_data,
-            "traderLogs": truncated_logs,
-            "orders": {
-                symbol: [
-                    (order.symbol, order.price, order.quantity) for order in order_list
-                ]
-                for symbol, order_list in result.items()
-            },
+            "trader_data": trader_data,
+            "listings": self.compress_listings(state.listings),
+            "order_depths": self.compress_order_depths(state.order_depths),
+            "own_trades": self.compress_trades(state.own_trades),
+            "market_trades": self.compress_trades(state.market_trades),
+            "position": state.position,
+            "observations": self.compress_observations(state.observations)
         }
 
-        # Finally print the entire structure as JSON (or you could return it, etc.)
-        print(json.dumps(output_data, separators=(",", ":")))
+        flat_orders = self.compress_orders(orders)
+        flat_logs = self.logs
 
-        # Clear logs after flushing
+        flat_structure = {
+            "state": flat_state,
+            "orders": flat_orders,
+            "conversions": conversions,
+            "logs": flat_logs
+        }
+
+        print(json.dumps(flat_structure, separators=(",", ":")))
         self.logs = ""
+
+
+    def compress_state(self, state: TradingState, trader_data: str) -> list[Any]:
+        return [
+            state.timestamp,
+            trader_data,
+            self.compress_listings(state.listings),
+            self.compress_order_depths(state.order_depths),
+            self.compress_trades(state.own_trades),
+            self.compress_trades(state.market_trades),
+            state.position,
+            self.compress_observations(state.observations),
+        ]
+
+    def compress_listings(self, listings: dict[Symbol, Listing]) -> list[list[Any]]:
+        compressed = []
+        for listing in listings.values():
+            compressed.append([listing["symbol"], listing["product"], listing["denomination"]])
+
+        return compressed
+
+    def compress_order_depths(self, order_depths: dict[Symbol, OrderDepth]) -> dict[Symbol, list[Any]]:
+        compressed = {}
+        for symbol, order_depth in order_depths.items():
+            compressed[symbol] = [order_depth.buy_orders, order_depth.sell_orders]
+
+        return compressed
+
+    def compress_trades(self, trades: dict[Symbol, list[Trade]]) -> list[list[Any]]:
+        compressed = []
+        for arr in trades.values():
+            for trade in arr:
+                compressed.append([
+                    trade.symbol,
+                    trade.price,
+                    trade.quantity,
+                    trade.buyer,
+                    trade.seller,
+                    trade.timestamp,
+                ])
+
+        return compressed
+
+    def compress_observations(self, observations: ConversionObservation) -> list[Any]:
+        conversion_observations = {}
+        for product, observation in observations.conversionObservations.items():
+            conversion_observations[product] = [
+                observation.bidPrice,
+                observation.askPrice,
+                observation.transportFees,
+                observation.exportTariff,
+                observation.importTariff,
+                observation.sugarPrice,
+                observation.sunlightIndex,
+            ]
+
+        return [observations.plainValueObservations, conversion_observations]
+
+    def compress_orders(self, orders: dict[Symbol, list[Order]]) -> list[list[Any]]:
+        compressed = []
+        for arr in orders.values():
+            for order in arr:
+                compressed.append([order.symbol, order.price, order.quantity])
+
+        return compressed
+
+    def to_json(self, value: Any) -> str:
+        return json.dumps(value, cls=ProsperityEncoder, separators=(",", ":"))
+
+    def truncate(self, value: str, max_length: int) -> str:
+        if len(value) <= max_length:
+            return value
+
+        return value[:max_length - 3] + "..."
 
 logger = Logger()
 
@@ -112,8 +155,13 @@ class Status:
     }
     
     arima_signal_return_correlation = {
-        'RAINFOREST_RESIN': 0.66059118,
-        'KELP': 0.5244263
+        'RAINFOREST_RESIN': 1, #0.66059118,
+        'KELP': 1 #0.5244263
+    }
+
+    max_levels = {
+        'RAINFOREST_RESIN': 1e9,
+        'KELP': 1e9
     }
 
     @classmethod
@@ -160,7 +208,7 @@ class Strategy:
         theo: float,
         past_log_returns: List[float],
         position: int,
-        lag_volatility: int = 10
+        lag_volatility: int = 5
     ) -> List[Order]:
         """
         Given theo, if we have a valid vol, place a buy at fair - std,
@@ -194,6 +242,10 @@ class Strategy:
                 sell_qty = max_sellable // 2
                 orders.append(Order(symbol, int(sell_price), -sell_qty))
 
+
+        logger.print(f"Volatility posting for {symbol} at {theo} with std {std_theo}")
+        logger.print(f"Current position: {position}, max buyable: {max_buyable}, max sellable: {max_sellable}")
+        logger.print(f"Orders: {[(order.symbol, order.price, order.quantity) for order in orders]}")
         return orders
 
     @staticmethod
@@ -202,6 +254,7 @@ class Strategy:
         order_depth: OrderDepth,
         theo: float,
         position: int,
+        max_levels: int = 2
     ) -> List[Order]:
         """
         Clear all levels that have expectation relative to theo.
@@ -214,6 +267,7 @@ class Strategy:
         max_buyable = pos_limit - position
 
         asks_sorted = sorted(order_depth.sell_orders.items(), key=lambda x: x[0])
+        levels_bought = 0
         for ask_price, ask_vol in asks_sorted:
 
             # sell_orders have negative volumes, so flip sign
@@ -228,6 +282,10 @@ class Strategy:
             if buy_qty > 0:
                 orders.append(Order(symbol, int(ask_price), buy_qty))
                 max_buyable -= buy_qty
+                levels_bought += 1
+
+            if levels_bought >= max_levels:
+                break
 
             # If we hit our position limit, break out
             if max_buyable <= 0:
@@ -236,6 +294,7 @@ class Strategy:
         max_sellable = pos_limit + position  # Maximum amount we can sell
 
         bids_sorted = sorted(order_depth.buy_orders.items(), key=lambda x: x[0], reverse=True)
+        levels_sold = 0
         for bid_price, bid_vol in bids_sorted:
 
             # If the bid price is below our theoretical value, stop selling
@@ -249,6 +308,10 @@ class Strategy:
             if sell_qty > 0:
                 orders.append(Order(symbol, int(bid_price), -sell_qty))
                 max_sellable -= sell_qty
+                levels_sold += 1
+
+            if levels_sold >= max_levels:
+                break
 
             # If we hit our position limit, break out
             if max_sellable <= 0:
@@ -270,7 +333,7 @@ class Strategy:
         past_log_returns: List[float],
         past_residuals: List[float],
         position: int,
-        model = 'HAR'
+        model = 'HAR',
     ) -> List[Order]:
         """
         1) Given past log-returns, calculate future return with a HAR model.
@@ -328,7 +391,7 @@ class Strategy:
 
             future_theo = theo * (1 + expected_return)
             
-        orders += Strategy.clear_levels(symbol, order_depth, future_theo, position)
+        orders += Strategy.clear_levels(symbol, order_depth, future_theo, position, max_levels = Status.max_levels[symbol])
                 
         return orders, expected_return
 
@@ -459,6 +522,52 @@ class Trader:
                 
         return theo
 
+    @staticmethod
+    def compress_trader_data(data: dict, max_entries: int = 50) -> dict:
+        """
+        Compress and flatten trader data.
+        For keys with list values (like past_theos, past_log_returns, past_residuals, past_position, expected_return),
+        only keep the last `max_entries` items.
+        For past_trades, convert each Trade object into a flat list.
+        For keys holding orders (last_maker_buy_orders, etc.), convert each Order (or order tuple) to a list.
+        """
+        compressed = {}
+        for key, value in data.items():
+            if key in ['past_theos', 'past_log_returns', 'past_residuals', 'past_position', 'expected_return']:
+                # For these, assume value is a dict mapping symbol to a list.
+                compressed[key] = {
+                    symbol: (vals[-max_entries:] if isinstance(vals, list) else vals)
+                    for symbol, vals in value.items()
+                }
+            elif key == 'past_trades':
+                # Convert each trade to a flat list.
+                compressed[key] = {}
+                for symbol, trades in value.items():
+                    # Ensure trades is a list.
+                    
+                    compressed[key][symbol] = []
+                    for trade in trades:
+                        compressed[key][symbol].append([trade.symbol, trade.price, trade.quantity, trade.buyer, trade.seller, trade.timestamp])
+
+
+            elif key in ['order_book_bids', 'order_book_asks', 'market_trades_data']:
+                # These are assumed to be already small dictionaries.
+                compressed[key] = value
+            elif key in ['last_maker_buy_orders', 'last_maker_sell_orders', 'last_taker_buy_orders', 'last_taker_sell_orders']:
+                # Convert each order (or order tuple) to a flat list [symbol, price, quantity].
+                compressed[key] = {
+                    symbol: [
+                        [order.symbol, order.price, order.quantity] if isinstance(order, Order)
+                        else (list(order) if isinstance(order, tuple) else order)
+                        for order in orders
+                    ]
+                    for symbol, orders in value.items()
+                }
+            else:
+                compressed[key] = value
+        return compressed
+
+
     def run(self, state: TradingState) -> Tuple[Dict[str, List[Order]], int, str]:
         """
         Calls Trade functions directly, which now handle multiple strategies.
@@ -533,18 +642,20 @@ class Trader:
             # WEIGHTED MIDPRICE
             theo = Trader.weighted_midprice(order_depth)
 
+            # logger.print(f"Theoretical Price at timestamp {timestamp} for {symbol}: {theo}")
 
             if len(past_theos[symbol]) > 0:
                 past_log_returns[symbol].append(np.log(theo / past_theos[symbol][-1]))
                 realized_return[symbol] = np.log(theo / past_theos[symbol][-1])
-                past_residuals[symbol].append(realized_return[symbol] - past_expected_return[symbol][-1])
+                past_residuals[symbol].append(realized_return[symbol] - past_expected_return[symbol])
             else:
-                past_log_returns[symbol].append(0.0)  # Append 0 if no previous theo
+                past_log_returns[symbol].append(0.0) 
                 realized_return[symbol] = 0.0
                 past_residuals[symbol].append(0.0)
+                past_expected_return[symbol] = 0.0
 
-            logger.print(f"Expected Return at timestamp {timestamp} for {symbol}: {past_expected_return[symbol]}")
-            logger.print(f"Realized Return at timestamp {timestamp} for {symbol}: {realized_return[symbol]}")
+            # logger.print(f"Expected Return at timestamp {timestamp} for {symbol}: {past_expected_return[symbol]}")
+            # logger.print(f"Realized Return at timestamp {timestamp} for {symbol}: {realized_return[symbol]}")
 
             past_theos[symbol].append(theo)
 
@@ -560,6 +671,7 @@ class Trader:
                         past_log_returns[symbol], past_residuals[symbol], current_position
                     )
                     result[symbol] = orders_maker + orders_taker
+                    # logger.print(f"[{timestamp}][{symbol}] Orders Resin: {json.dumps(orders_maker)} + {json.dumps(orders_taker)}")
                 elif symbol == "KELP":
                     orders_maker, orders_taker, expected_return = Trade.kelp(
                         symbol, theo, order_depth, past_theos[symbol],
@@ -569,14 +681,22 @@ class Trader:
 
                 expected_return_next_period[symbol] = expected_return
 
+                # logger.print(f"[{timestamp}][{symbol}] Order Book: {json.dumps(order_depth.buy_orders)} + {json.dumps(order_depth.sell_orders)}")
+                # logger.print(f"[{timestamp}][{symbol}] Orders: {json.dumps(orders_maker)} + {json.dumps(orders_taker)}")
+
                 rolling_data['last_maker_buy_orders'][symbol] = [o for o in orders_maker if o.quantity > 0]
                 rolling_data['last_maker_sell_orders'][symbol] = [o for o in orders_maker if o.quantity < 0]
                 rolling_data['last_taker_buy_orders'][symbol] = [o for o in orders_taker if o.quantity > 0]
                 rolling_data['last_taker_sell_orders'][symbol] = [o for o in orders_taker if o.quantity < 0]
 
 
-
         # Parsing Market Trades
+
+        # market_trades = {
+        #     "PRODUCT1": [],
+        #     "PRODUCT2": []
+        # }
+        
         market_trades_data = {}
         for symbol, trades in state.market_trades.items():
             market_trades_data[symbol] = {}
@@ -591,10 +711,45 @@ class Trader:
             market_trades_data[symbol]['total_volume'] = total_volume
 
         # Parsing Own Trades
+
+        # own_trades = {
+        #     "PRODUCT1": [
+        #         Trade(
+        #             symbol="PRODUCT1",
+        #             price=11,
+        #             quantity=4,
+        #             buyer="SUBMISSION",
+        #             seller="",
+        #             timestamp=1000
+        #         ),
+        #         Trade(
+        #             symbol="PRODUCT1",
+        #             price=12,
+        #             quantity=3,
+        #             buyer="SUBMISSION",
+        #             seller="",
+        #             timestamp=1000
+        #         )
+        #     ],
+        #     "PRODUCT2": [
+        #         Trade(
+        #             symbol="PRODUCT2",
+        #             price=143,
+        #             quantity=2,
+        #             buyer="",
+        #             seller="SUBMISSION",
+        #             timestamp=1000
+        #         ),
+        #     ]
+        # }
+
         own_trades = state.own_trades
+
+        own_past_trades = {}
         for symbol in state.listings:
+
             trades = own_trades.get(symbol, [])
-            past_trades[symbol].append(trades)
+            own_past_trades[symbol] = trades
 
             # Compute fill percentage
             total_filled = np.sum([abs(t.quantity) for t in trades])
@@ -607,7 +762,7 @@ class Trader:
             maker_fill_pct[symbol] = total_filled / total_maker_submitted if total_maker_submitted > 0 else 0
             taker_fill_pct[symbol] = total_filled / total_taker_submitted if total_taker_submitted > 0 else 0
 
-            logger.print(f"[{timestamp}][{symbol}] Maker Fill %: {maker_fill_pct[symbol]:.2%}, Taker Fill %: {taker_fill_pct[symbol]:.2%}")
+            # logger.print(f"[{timestamp}][{symbol}] Maker Fill %: {maker_fill_pct[symbol]:.2%}, Taker Fill %: {taker_fill_pct[symbol]:.2%}")
 
         # Parsing Position
         for symbol in state.listings:
@@ -621,30 +776,34 @@ class Trader:
             past_theos[symbol] = past_theos[symbol][-max_lag:]
             past_log_returns[symbol] = past_log_returns[symbol][-max_lag:]
             past_residuals[symbol] = past_residuals[symbol][-max_lag:]
-            past_trades[symbol] = past_trades[symbol][-max_lag:]
             past_position[symbol] = past_position[symbol][-max_lag:]
 
 
         # Update stored trader data properly
-        new_trader_data = jsonpickle.encode({
-            'order_book_bids': order_book_bids,
-            'order_book_asks': order_book_asks,
-            'past_theos': past_theos,
-            'market_trades_data': market_trades_data,
-            'past_log_returns': past_log_returns,
-            'past_residuals': past_residuals,
-            'past_trades': past_trades,
-            'past_position': past_position,
-            'last_maker_buy_orders': rolling_data['last_maker_buy_orders'],
-            'last_maker_sell_orders': rolling_data['last_maker_sell_orders'],
-            'last_taker_buy_orders': rolling_data['last_taker_buy_orders'],
-            'last_taker_sell_orders': rolling_data['last_taker_sell_orders'],
-            'expected_return': expected_return_next_period
-
-        })
+        new_trader_data = json.dumps(
+            Trader.compress_trader_data({
+                'order_book_bids': order_book_bids,
+                'order_book_asks': order_book_asks,
+                'market_trades_data': market_trades_data,
+                'past_theos': past_theos,
+                'past_log_returns': past_log_returns,
+                'past_residuals': past_residuals,
+                'past_trades': own_past_trades,
+                'past_position': past_position,
+                'last_maker_buy_orders': rolling_data['last_maker_buy_orders'],
+                'last_maker_sell_orders': rolling_data['last_maker_sell_orders'],
+                'last_taker_buy_orders': rolling_data['last_taker_buy_orders'],
+                'last_taker_sell_orders': rolling_data['last_taker_sell_orders'],
+                'expected_return': expected_return_next_period
+            }), separators=(",", ":")
+        )
 
         # Request Conversions (default is 0)
         conversions = 0
+
+        # print(logger.to_json(logger.compress_state(state, "")))
+        # print(logger.to_json(logger.compress_orders(result)))
+        # print(logger.truncate(state.traderData, 100))
 
         logger.flush(state, result, conversions, new_trader_data)
 
