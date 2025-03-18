@@ -119,9 +119,15 @@ class Status:
     def __init__(self, max_lags: int,
                  position_limit: int,
                  volatility_product_constant: float,
+                 har_intercept: float,
                  har_lags: List[int],
                  har_betas: List[float],
                  har_signal_return_correlation: float,
+                 forecast_har_intercept: float,
+                 forecast_har_lags: List[int],
+                 forecast_har_betas: List[float],
+                 forecast_har_signal_return_correlation: float,
+                 arima_intercept: float,
                  arima_parameters: Dict[str, Tuple[int, int, int]],
                  arima_betas: Dict[str, Tuple[np.ndarray, np.ndarray]],
                  arima_signal_return_correlation: Dict[str, float],
@@ -129,14 +135,23 @@ class Status:
                  volatility_offset_sample: Dict[str, List[float]],
                  offset_quote_size_proportion: Dict[str, float],
                  order_book_volume_weights: Dict[str, np.ndarray],
-                 market_own_volume_weights: Dict[str, np.ndarray]):
-        
+                 market_own_volume_weights: Dict[str, np.ndarray],
+                 minimum_edge_taker: float,
+                 forecast_model_type: str,
+         ):
+
         self.max_lags = max_lags
         self.position_limit = position_limit
         self.volatility_product_constant = volatility_product_constant
+        self.har_intercept = har_intercept
         self.har_lags = har_lags
         self.har_betas = har_betas
         self.har_signal_return_correlation = har_signal_return_correlation
+        self.forecast_har_intercept = forecast_har_intercept
+        self.forecast_har_lags = forecast_har_lags
+        self.forecast_har_betas = forecast_har_betas
+        self.forecast_har_signal_return_correlation = forecast_har_signal_return_correlation
+        self.arima_intercept = arima_intercept
         self.arima_parameters = arima_parameters
         self.arima_betas = arima_betas
         self.arima_signal_return_correlation = arima_signal_return_correlation
@@ -145,27 +160,29 @@ class Status:
         self.offset_quote_size_proportion = offset_quote_size_proportion
         self.order_book_volume_weights = order_book_volume_weights
         self.market_own_volume_weights = market_own_volume_weights
-    
-
+        self.minimum_edge_taker = minimum_edge_taker
+        self.forecast_model_type = forecast_model_type
 class Strategy:
 
     @staticmethod
     def posting_orders(
         status_object: Status,
         symbol: str,
-        theo: float,
+        orderbook_theo: float,
+        signal_theo: float,
+        forecast_theo: float,
+        volatility: float,
         position: int,
     ) -> Tuple[List[Order], List[float]]:
 
-        if np.isnan(theo):
+        if np.isnan(orderbook_theo) or np.isnan(signal_theo) or np.isnan(forecast_theo):
             return [], []
 
         orders: List[Order] = []
 
-        volatility = status_object.volatility_product_constant
         volatility_offsets = status_object.volatility_offset_sample
         
-        std_theo = volatility * theo
+        std_theo = volatility * orderbook_theo
 
         pos_limit = status_object.position_limit
 
@@ -232,6 +249,11 @@ class Strategy:
             if ask_price > theo:
                 break
 
+            edge = theo - ask_price
+
+            if edge < status_object.minimum_edge_taker:
+                break
+
             # How many we can buy here, respecting our remaining limit
             buy_qty = min(max_buyable, volume_available)
             if buy_qty > 0:
@@ -252,11 +274,16 @@ class Strategy:
         levels_sold = 0
         for bid_price, bid_vol in bids_sorted:
 
+            volume_available = bid_vol  # Buy orders are positive volumes
+
             # If the bid price is below our theoretical value, stop selling
             if bid_price < theo:
                 break
 
-            volume_available = bid_vol  # Buy orders are positive volumes
+            edge = bid_price - theo
+
+            if edge < status_object.minimum_edge_taker:
+                break
 
             # How many we can sell here, respecting our remaining limit
             sell_qty = min(max_sellable, volume_available)
@@ -279,21 +306,18 @@ class Strategy:
         status_object: Status,
         symbol: str,
         order_depth: OrderDepth,
-        theo: float,
+        orderbook_theo: float,
+        signal_theo: float,
+        forecast_theo: float,
         position: int,
         max_levels: int
     ) -> List[Order]:
-        """
-        1) Given past returns, calculate future return with a HAR model.
-        3) If we have orders we'd like to trade against, we lift / sell all levels above / below our fair price.
-
-        Hardcoded Coefficients:
-            lags, betas, corr_signal_return
-        """
-
+        
         orders = []
 
-        orders += Strategy.clear_levels(status_object, symbol, order_depth, theo, position, max_levels = min(max_levels, status_object.max_levels))
+        # FIX THIS
+
+        # orders += Strategy.clear_levels(status_object, symbol, order_depth, theo, position, max_levels = min(max_levels, status_object.max_levels))
                 
         return orders
 
@@ -307,8 +331,10 @@ class Trade:
     def execute_trades(
         status_object: Status,
         symbol: str,
-        market_making_theo: float,
-        taking_theo: float,
+        orderbook_theo: float,
+        signal_theo: float,
+        forecast_theo: float,
+        volatility: float,
         order_depth: OrderDepth,
         position: int
     ) -> List[Order]:
@@ -316,11 +342,11 @@ class Trade:
         orders_maker, orders_taker, effective_offsets_demanded = [], [], []
 
         # Forecasting Taking Strategy
-        signal_orders = Strategy.signal_taking(status_object, symbol, order_depth, taking_theo, position, 1e9)
+        signal_orders = Strategy.signal_taking(status_object, symbol, order_depth, orderbook_theo, signal_theo, forecast_theo, position, 1e9)
         orders_taker += signal_orders
 
-        # Volatility-Based Posting (Fair Price ± 1 Std)
-        quoting_orders, effective_offsets_demanded = Strategy.posting_orders(status_object, symbol, market_making_theo, position)
+        # Volatility-Based Posting (Fair Price ± 1 Std) 
+        quoting_orders, effective_offsets_demanded = Strategy.posting_orders(status_object, symbol, orderbook_theo, signal_theo, forecast_theo, volatility, position)
         orders_maker += quoting_orders
 
         return orders_maker, orders_taker, effective_offsets_demanded
@@ -410,9 +436,6 @@ class Calculation:
 
         if not order_depth.buy_orders and not order_depth.sell_orders:
             return np.nan
-        
-        bid_side = []
-        ask_side = []
 
         order_book_volume_weights = status_object.order_book_volume_weights
         market_weight, own_weight = status_object.market_own_volume_weights
@@ -425,66 +448,71 @@ class Calculation:
         sorted_bids = sorted(order_depth.buy_orders.items(), key=lambda x: x[0], reverse=True)[:levels]
         sorted_asks = sorted(order_depth.sell_orders.items(), key=lambda x: x[0], reverse=False)[:levels]
 
-        # Process Bids
+        total_bid_weight, total_ask_weight, total_bid_volume, total_ask_volume, weighted_bid_price, weighted_ask_price = 0, 0, 0, 0, 0, 0
+
         for idx_tup, bid_tup in enumerate(sorted_bids):
             bid_price, bid_volume = bid_tup
-            bid_volume_weight = bid_volume * order_book_volume_weights[idx_tup]
-
             if bid_volume > 0 and np.isfinite(bid_price) and np.isfinite(bid_volume):
-                bid_side.append((bid_price, bid_volume_weight))
+                total_bid_weight += bid_volume * order_book_volume_weights[idx_tup]
+                total_bid_volume += bid_volume
+                weighted_bid_price += bid_price * bid_volume * order_book_volume_weights[idx_tup]
 
-        # Process Asks - Fix the Negative Volume Issue
         for idx_tup, ask_tup in enumerate(sorted_asks):
             ask_price, ask_volume = ask_tup
             ask_volume *= -1
-            ask_volume_weight = ask_volume * order_book_volume_weights[idx_tup]
-
             if ask_volume > 0 and np.isfinite(ask_price) and np.isfinite(ask_volume):
-                ask_side.append((ask_price, ask_volume_weight))
+                total_ask_weight += ask_volume * order_book_volume_weights[idx_tup]
+                total_ask_volume += ask_volume
+                weighted_ask_price += ask_price * ask_volume * order_book_volume_weights[idx_tup]
 
-        # If either side is empty, return NaN
-        if not bid_side or not ask_side:
-            theo = np.nan
+        weighted_bid_price /= total_bid_weight
+        weighted_ask_price /= total_ask_weight
 
+        if np.isfinite(weighted_bid_price) and np.isfinite(weighted_ask_price):
+            theo = (weighted_bid_price * total_ask_volume + weighted_ask_price * total_bid_volume + market_price * market_weighted_volume + own_price * own_weighted_volume) / (total_bid_volume + total_ask_volume + market_weighted_volume + own_weighted_volume)
         else:
-            
-            total_bid_weight = sum(volume for _, volume in bid_side)
-            total_ask_weight = sum(volume for _, volume in ask_side)
-
-            weighted_bid_price = (
-                sum(price * volume for price, volume in bid_side) / total_bid_weight
-                if total_bid_weight > 0 else np.nan
-            )
-
-            weighted_ask_price = (
-                sum(price * volume for price, volume in ask_side) / total_ask_weight
-                if total_ask_weight > 0 else np.nan
-            )
-
-            if np.isfinite(weighted_bid_price) and np.isfinite(weighted_ask_price):
-                theo = (weighted_bid_price * total_ask_weight + weighted_ask_price * total_bid_weight + market_price * market_weighted_volume + own_price * own_weighted_volume) / (total_bid_weight + total_ask_weight + market_weighted_volume + own_weighted_volume)
-            else:
-                theo = np.nan
+            theo = np.nan
                 
         return theo
+    
+    @staticmethod
+    def constant_vol(
+        **kwargs
+    ):
+        
+        return kwargs['status_object'].volatility_product_constant
+
+    @staticmethod
+    def linear_regression_vol(
+        **kwargs
+    ):
+
+        returns = kwargs['returns']
+        status_object = kwargs['status_object']
+
+        return 1
+
 
     @staticmethod
     def forecast_returns(
         status_object: Status,
         theo: float,
-        returns: List[float],
-        residuals: List[float],
-        model = 'HAR',
+        returns: Dict[str, List[float]],
+        residuals: Dict[str, List[float]],
     ) -> Tuple[float, float, float]:
 
-        if model == 'HAR':
+        expected_return, future_theo, future_trade_theo = 0.0, 0.0, 0.0
+        
+        if status_object.forecast_model_type == 'HAR':
 
+            intercept = status_object.har_intercept
             lags = status_object.har_lags
             betas = status_object.har_betas
             corr_signal_return = status_object.har_signal_return_correlation
 
             if len(returns) < max(lags):
                 return 0, theo, theo
+
 
             features = np.zeros(len(betas))
 
@@ -495,13 +523,13 @@ class Calculation:
                 else:
                     features[i] = np.mean(returns_rev[lags[i-1]:lag])
 
-            expected_return = np.sum(betas * features)
-            expected_abs_return = np.exp(expected_return) - 1
-            future_theo = theo * (1 + expected_abs_return)
-            future_trade_theo = theo * (1 + corr_signal_return * expected_abs_return)
+            expected_return = np.sum(betas * features) + intercept
+            future_theo = theo * (1 + expected_return)
+            future_trade_theo = theo * (1 + corr_signal_return * expected_return)
 
-        else:
+        if status_object.forecast_model_type == 'ARIMA':
 
+            intercept = status_object.arima_intercept
             betas_y, betas_residual = status_object.arima_betas
             p, d, q = status_object.arima_parameters
             corr_signal_return = status_object.arima_signal_return_correlation
@@ -515,17 +543,14 @@ class Calculation:
             features = np.zeros(len(betas_y))
 
             returns_rev = returns[::-1]
-
             residuals_rev = residuals[::-1]
 
             ar_term = np.dot(betas_y, returns_rev[:len(betas_y)]) if len(betas_y) > 0 else 0.0
             ma_term = np.dot(betas_residual, residuals_rev[:len(betas_residual)]) if len(betas_residual) > 0 else 0.0
 
-            expected_return = ar_term + ma_term
-            expected_abs_return = np.exp(expected_return) - 1
-
-            future_theo = theo * (1 + expected_abs_return)
-            future_trade_theo = theo * (1 + corr_signal_return * expected_abs_return)
+            expected_return = ar_term + ma_term + intercept
+            future_theo = theo * (1 + expected_return)
+            future_trade_theo = theo * (1 + corr_signal_return * expected_return)
 
         return float(expected_return), float(future_theo), float(future_trade_theo)
             
@@ -585,46 +610,61 @@ class Calculation:
 class Trader:
 
     def __init__(self):
-        self.kelp = Status(max_lags = 3,
-                           position_limit = 50,
-                           volatility_product_constant = 1.489797e-07 ** 0.5,
-                           har_lags = [1, 2, 5],
-                           har_betas = np.array([-0.58603507, -0.30877435, -0.34055787]),
-                           har_signal_return_correlation = 0.5111646163263679,
-                           arima_parameters = (0, 0, 1),
-                           arima_betas = (np.array([]), np.array([-0.6])),
-                           arima_signal_return_correlation = 0.5244263,
-                           max_levels = 1e9,
-                           volatility_offset_sample = [0.2, 0.5, 1, 2],
-                           offset_quote_size_proportion = 0.1,
-                           order_book_volume_weights = np.array([1, 0.8725848 , 0.71203151]),
-                           market_own_volume_weights = np.array([0.41013304, 0.14665224])
-                           ) 
-        
-        self.rainforest_resin = Status(max_lags = 3,
-                           position_limit = 50,
-                           volatility_product_constant = 4.427334e-08 ** 0.5,
-                           har_lags = [1, 2, 5],
-                           har_betas = np.array([-0.73541417, -0.50879543, -0.75997904]),
-                           har_signal_return_correlation = 0.6094643900796544,
-                           arima_parameters = (1, 0, 1),
-                           arima_betas = (np.array([0.042213]), np.array([-0.79403773])),
-                           arima_signal_return_correlation = 0.66059118,
-                           max_levels = 1e9,
-                           volatility_offset_sample = [0.2, 0.5, 1, 2],
-                           offset_quote_size_proportion = 0.1,
-                           order_book_volume_weights = np.array([1, 0.85641534, 0.61227611]),
-                           market_own_volume_weights = np.array([0.58079727, 0.0450033 ])
-                           ) 
-        
-        self.status_dict = {
-            'RAINFOREST_RESIN': self.rainforest_resin,
-            'KELP': self.kelp
+
+        status_params = {
+            "RAINFOREST_RESIN": {
+                "max_lags": 3,
+                "position_limit": 50,
+                "volatility_product_constant": 4.427334e-08 ** 0.5,
+                "har_intercept": 0,
+                "har_lags": [1],
+                "har_betas": np.array([-0.500568135273929]),
+                "har_signal_return_correlation": 0.689941382932617,
+                "arima_intercept": 0,
+                "arima_parameters": (0, 0, 3),
+                "arima_betas": (np.array([]), np.array([-0.8729, -0.0108, 0.0683])),
+                "arima_signal_return_correlation": 0.686221539,
+                "max_levels": 1e9,
+                "volatility_offset_sample": [0.2, 0.5, 1, 2],
+                "offset_quote_size_proportion": 0.5,
+                "order_book_volume_weights": np.array([1, 0.85641534, 0.61227611]),
+                "market_own_volume_weights": np.array([0.58079727, 0.0450033]),
+                "minimum_edge_taker": 0,
+                "forecast_model_type": "ARIMA"
+            },
+            "KELP": {
+                "max_lags": 3,
+                "position_limit": 50,
+                "volatility_product_constant": 1.489797e-07 ** 0.5,
+                "har_intercept": 0,
+                "har_lags": [1],
+                "har_betas": np.array([-0.2594471579859045]),
+                "har_signal_return_correlation": 0.2905178447520445,
+                "arima_intercept": 0,
+                "arima_parameters": (1, 0, 0),
+                "arima_betas": (np.array([-0.2614]), np.array([])),
+                "arima_signal_return_correlation": 0.261342687,
+                "max_levels": 1e9,
+                "volatility_offset_sample": [0.4, 1, 2],
+                "offset_quote_size_proportion": 0.4,
+                "order_book_volume_weights": np.array([1, 0.8725848, 0.71203151]),
+                "market_own_volume_weights": np.array([0.41013304, 0.14665224]),
+                "minimum_edge_taker": 0,
+                "forecast_model_type": "ARIMA"
+            }
         }
+
+        self.status_dict = {key: Status(**params) for key, params in status_params.items()}
+
 
         self.theo_map = {
             'RAINFOREST_RESIN': Calculation.orderbook_theo_function,
             'KELP': Calculation.orderbook_theo_function
+        }
+
+        self.vol_map = {
+            'RAINFOREST_RESIN': Calculation.constant_vol,
+            'KELP': Calculation.constant_vol
         }
 
     @staticmethod
@@ -680,7 +720,17 @@ class Trader:
         # Build Order Book
         for symbol, order_depth in state.order_depths.items():
 
-            kwargs = {
+            kwargs_vol = {
+                'status_object': self.status_dict[symbol],
+                'returns': returns[symbol],
+                # 'ewma_variance': ewma_variance[symbol]
+            }
+
+            vol_function = self.vol_map[symbol]
+
+            vol_theo = vol_function(**kwargs_vol)
+
+            kwargs_theo = {
                 'status_object': self.status_dict[symbol],
                 'order_depth': order_depth,
                 'market_trades_data': market_trades_data,
@@ -688,11 +738,12 @@ class Trader:
                 'market_volume': market_trades_data[symbol]['total_volume'],
                 'own_price': own_trades_data[symbol]['average_weighted_price'],
                 'own_volume': own_trades_data[symbol]['total_volume'],
+                'vol': vol_theo,
             }
 
-            strategy_function = self.theo_map[symbol]
+            theo_function = self.theo_map[symbol]
 
-            orderbook_theo = strategy_function(**kwargs)
+            orderbook_theo = theo_function(**kwargs_theo)
 
             current_position = state.position.get(symbol, 0)
 
@@ -707,7 +758,7 @@ class Trader:
                 returns[symbol].append(0.0) 
                 residuals[symbol].append(0.0)
 
-            expected_return, market_making_theo, taking_theo = Calculation.forecast_returns(self.status_dict[symbol], orderbook_theo, returns[symbol], residuals[symbol], model='ARIMA')
+            expected_return, market_making_theo, taking_theo = Calculation.forecast_returns(self.status_dict[symbol], orderbook_theo, returns[symbol], residuals[symbol])
 
             expected_return_next_period[symbol] = expected_return
 
@@ -717,7 +768,7 @@ class Trader:
             if len(order_depth.buy_orders) > 0 and len(order_depth.sell_orders) > 0:
 
                 orders_maker, orders_taker, effective_offsets_demanded = Trade.execute_trades(
-                    self.status_dict[symbol], symbol, market_making_theo, taking_theo, order_depth, 
+                    self.status_dict[symbol], symbol, market_making_theo, taking_theo, vol_theo, order_depth, 
                     current_position
                 )
 
@@ -729,7 +780,6 @@ class Trader:
                     rolling_data['maker_orders'][symbol].append(order_info_tup)
 
                 rolling_data['taker_orders'][symbol] = orders_taker
-                
 
         # Remove oldest values if memory limit is exceeded
         for symbol in state.order_depths.keys():
@@ -743,7 +793,7 @@ class Trader:
         new_trader_data = json.dumps(
             Trader.compress_trader_data({
                 'market_trades_data': market_trades_data,
-                'own_trades_data': own_trades_data,
+                'own_trades_data': own_trades_data, 
                 'orderbook_theos': orderbook_theos,
                 'signal_theos': signal_theos,
                 'returns': returns,
